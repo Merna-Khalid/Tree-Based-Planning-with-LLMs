@@ -83,19 +83,19 @@ class GRPOConfig:
 
     # Model
     model_id: str = "google/gemma-3-4b-it"
-    load_in_4bit: bool = True           # save VRAM with 4-bit quantisation
+    load_in_4bit: bool = False           # save VRAM with 4-bit quantisation
 
     # Output
     output_dir: str = "./checkpoints/sokoban-grpo"
 
     # Data  — mirrors MLXGRPOConfig fields set in the notebook
     repr_key: str = "13_ACTION_CENTRIC"         # MLX: config.repr_key
-    num_train_puzzles: int = 50                  # MLX: config.num_train_puzzles
+    num_train_puzzles: int = 30                  # MLX: config.num_train_puzzles
     max_steps_per_puzzle: int = 30               # MLX: config.max_steps_per_puzzle
 
     # GRPO hyperparameters (matching MLX GRPO)
     num_generations: int = 8            # completions sampled per prompt (G) — MLX: group_size=4 default
-    num_epochs: float = 3.0
+    num_epochs: float = 1.0
     per_device_batch_size: int = 1      # small — each batch has num_generations completions
     gradient_accumulation_steps: int = 8
     learning_rate: float = 1e-6        # MLX default: 1e-5; set conservatively for GPU
@@ -228,7 +228,7 @@ def compute_reward_batch(
 
 
 # ============================================================================
-# Debug utility — ported from MLX grpo.py
+# Debug utility
 # ============================================================================
 
 def debug_generation(model, tokenizer, prompt: str, max_tokens: int = 256) -> str:
@@ -236,50 +236,63 @@ def debug_generation(model, tokenizer, prompt: str, max_tokens: int = 256) -> st
     Generate one response and print a diagnostic breakdown.
     Mirrors the MLX debug_generation helper so both backends can be
     inspected in the same way.
-
-    Parameters
-    ----------
-    model:      A loaded HuggingFace model (or pipeline-compatible object).
-    tokenizer:  Matching tokenizer.
-    prompt:     Raw user-turn text (before chat template is applied).
-    max_tokens: Maximum new tokens to generate.
-
-    Returns the raw response string.
     """
     import torch
 
     messages = [{"role": "user", "content": prompt}]
-    input_ids = tokenizer.apply_chat_template(
+    
+    # apply_chat_template returns BatchEncoding (dict-like), not a raw tensor
+    inputs = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
         return_tensors="pt",
-    ).to(model.device)
+    )
+    # Move to device — handle both tensor and BatchEncoding
+    if hasattr(inputs, "to"):
+        inputs = inputs.to(model.device)
+    else:
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     print("\n" + "=" * 60)
     print("DEBUG: Model Generation")
     print("=" * 60)
 
     with torch.no_grad():
-        output_ids = model.generate(
-            input_ids,
+        # model.generate returns ModelOutput object with .sequences attribute
+        outputs = model.generate(
+            **inputs,
             max_new_tokens=max_tokens,
             do_sample=True,
             temperature=0.9,
         )
+        
+        # Handle both old (tensor) and new (ModelOutput) return formats
+        if hasattr(outputs, "sequences"):
+            output_ids = outputs.sequences
+        else:
+            output_ids = outputs
+
+    # Get prompt length for slicing — handle both tensor and BatchEncoding
+    if hasattr(inputs, "shape"):
+        prompt_length = inputs.shape[-1]
+    elif hasattr(inputs, "input_ids"):
+        prompt_length = inputs["input_ids"].shape[-1]
+    else:
+        prompt_length = inputs["input_ids"].shape[-1]
 
     # Decode only the newly generated tokens
-    new_tokens = output_ids[0][input_ids.shape[-1]:]
+    new_tokens = output_ids[0][prompt_length:]
     response = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     print(f"\nRaw response:\n{response}")
     print("\n" + "=" * 60)
 
-    has_think      = bool(re.search(r"<think>",      response, re.IGNORECASE))
-    has_nextmove   = bool(re.search(r"<NextMove>",   response, re.IGNORECASE))
-    has_confidence = bool(re.search(r"<Confidence>", response, re.IGNORECASE))
-    has_rationale  = bool(re.search(r"<Rationale>",  response, re.IGNORECASE))
+    has_think      = bool(re.search(r" thinking",     response, re.IGNORECASE))
+    has_nextmove   = bool(re.search(r"<NextMove>",    response, re.IGNORECASE))
+    has_confidence = bool(re.search(r"<Confidence>",  response, re.IGNORECASE))
+    has_rationale  = bool(re.search(r"<Rationale>",   response, re.IGNORECASE))
 
-    print(f"Has <think>:      {has_think}")
+    print(f"Has  thinking:    {has_think}")
     print(f"Has <NextMove>:   {has_nextmove}")
     print(f"Has <Confidence>: {has_confidence}")
     print(f"Has <Rationale>:  {has_rationale}")
@@ -392,12 +405,13 @@ def train_grpo(
         beta=config.beta,
         temperature=config.temperature,
         num_generations=config.num_generations,
-        max_prompt_length=config.max_prompt_length,
+        # max_prompt_length=config.max_prompt_length,
         max_completion_length=config.max_completion_length,
         logging_steps=config.logging_steps,
         save_steps=config.save_steps,
         seed=config.seed,
-        bf16=True,
+        bf16=False,
+        fp16=True,
         gradient_checkpointing=True,
         reward_weights=reward_weights,
     )
@@ -423,12 +437,14 @@ def train_grpo(
 
             model_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=torch.float16,
             )
         except ImportError:
             print(
                 "  ⚠ bitsandbytes not installed — training without 4-bit quantisation"
             )
+    # import torch
+    # model_kwargs["torch_dtype"] = torch.float16
 
     # ---- GRPOTrainer ----
     trainer = GRPOTrainer(
